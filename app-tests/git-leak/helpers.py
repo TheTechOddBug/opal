@@ -2,7 +2,7 @@
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import requests
 
@@ -50,7 +50,7 @@ class OpalServerClient:
             time.sleep(2)
         raise RuntimeError(f"opal-server not healthy in {timeout}s (last: {last})")
 
-    def stats(self, samples: int = 3, interval: float = 0.1) -> Dict[str, int]:
+    def stats(self, samples: int = 3, interval: float = 0.1) -> Dict[str, Any]:
         """Read the git-fetcher cache stats, merged across a few reads.
 
         The stack runs a single uvicorn worker (see docker-compose.yml), so the
@@ -59,15 +59,29 @@ class OpalServerClient:
         the ``max`` per key only smooths over a read that races an in-flight
         mutation; it is not relied on to paper over multi-worker nondeterminism
         (which the single-worker setup removes outright).
+
+        Merge semantics: numeric counts take the max across samples (peak
+        smoothing); ``pid`` and the ``*_keys`` lists are last-wins. The
+        count fields and their paired ``*_keys`` lists are therefore only
+        guaranteed mutually consistent at ``samples=1`` — which is what
+        every consistency-sensitive consumer (the invariant checker,
+        per-pid sampling) uses. Do not assert
+        ``len(stats["repos_keys"]) == stats["repos"]`` on a multi-sample
+        merge.
         """
-        merged: Dict[str, int] = {}
+        merged: Dict[str, Any] = {}
         for i in range(max(1, samples)):
             resp = requests.get(
                 f"{self.base_url}/internal/git-fetcher-cache-stats", timeout=10
             )
             resp.raise_for_status()
             for key, value in resp.json().items():
-                merged[key] = max(merged.get(key, 0), value)
+                if key != "pid" and isinstance(value, (int, float)):
+                    merged[key] = max(merged.get(key, 0), value)
+                else:
+                    # pid and the *_keys lists: last-wins (single-worker stack
+                    # makes every read hit the same worker anyway)
+                    merged[key] = value
             if i < samples - 1:
                 time.sleep(interval)
         return merged
@@ -234,7 +248,12 @@ class GiteaAdmin:
             return
         resp = requests.post(
             f"{self.base_url}/api/v1/user/repos",
-            json={"name": name, "private": False, "auto_init": True},
+            json={
+                "name": name,
+                "private": False,
+                "auto_init": True,
+                "default_branch": "main",
+            },
             auth=self._auth,
             timeout=10,
         )
@@ -248,6 +267,39 @@ class GiteaAdmin:
         )
         if resp.status_code not in (204, 404):
             resp.raise_for_status()
+
+
+class RepoMutator:
+    """Host-side git mutations against a bed Gitea repo (force-push, branch
+    ops) — the remote-transition tests' hands.
+
+    Uses GitPython over the published host port with admin basic-auth.
+    """
+
+    def __init__(self, name: str, workdir: Path):
+        import git as gitpython
+
+        self._url = (
+            f"http://{GITEA_USER}:{GITEA_PASSWORD}@localhost:13000/"
+            f"{GITEA_USER}/{name}.git"
+        )
+        self._clone = gitpython.Repo.clone_from(self._url, str(workdir / name))
+        with self._clone.config_writer() as cw:
+            cw.set_value("user", "name", "bed-mutator")
+            cw.set_value("user", "email", "bed@test.local")
+
+    def force_push_rewrite(self, branch: str = "main") -> None:
+        self._clone.git.checkout(branch)
+        self._clone.git.commit("--amend", "--allow-empty", "-m", "rewritten history")
+        self._clone.git.push("--force", "origin", branch)
+
+    def push_new_branch(self, branch: str) -> None:
+        self._clone.git.checkout("-b", branch)
+        self._clone.git.commit("--allow-empty", "-m", f"seed {branch}")
+        self._clone.git.push("origin", branch)
+
+    def delete_remote_branch(self, branch: str) -> None:
+        self._clone.git.push("origin", f":{branch}")
 
 
 def gitea_repo_url(name: str) -> str:
@@ -394,6 +446,47 @@ def bounce_postgres(down_seconds: int = 5, during=None) -> None:
         # `compose start` has no --wait), so a recovery poll that follows isn't
         # racing an unready broadcaster. --no-recreate keeps the same container.
         compose("up", "-d", "--wait", "--no-recreate", "postgres")
+
+
+def wait_until(predicate, timeout: float, interval: float = 2.0) -> bool:
+    """Poll ``predicate()`` until truthy or ``timeout`` elapses.
+
+    Swallows transient exceptions from the predicate (a stats read
+    racing a restart is not a verdict) — only the final state decides.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if predicate():
+                return True
+        except Exception:
+            pass
+        time.sleep(interval)
+    try:
+        return bool(predicate())
+    except Exception:
+        return False
+
+
+def stats_by_pid(opal, min_pids: int = 2, attempts: int = 200, interval: float = 0.05):
+    """Sample the stats endpoint repeatedly; keep the LATEST snapshot per pid.
+
+    Requests land on arbitrary workers, so repeated single-sample reads
+    eventually observe each worker. Returns {pid: latest_stats} once min_pids
+    distinct pids are seen (plus one grace sample for freshness), or after
+    `attempts` samples; the caller decides whether the count is sufficient.
+    """
+    seen = {}
+    grace_sweep_done = False
+    for _ in range(attempts):
+        snap = opal.stats(samples=1)
+        seen[snap["pid"]] = snap
+        if len(seen) >= min_pids:
+            if grace_sweep_done:
+                break
+            grace_sweep_done = True
+        time.sleep(interval)
+    return seen
 
 
 def list_seeded_repos(count: int) -> List[str]:

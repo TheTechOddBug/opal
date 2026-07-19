@@ -3,6 +3,7 @@
 Used only by the off-by-default /internal stats endpoint so tests can
 observe the cache growth that the memory-leak fix (PR2) eliminates.
 """
+import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -21,13 +22,28 @@ def _read_rss_kb() -> int:
     return 0
 
 
-def git_fetcher_cache_stats() -> Dict[str, int]:
-    """Sizes of the three process-global GitPolicyFetcher caches + RSS."""
+def git_fetcher_cache_stats() -> Dict:
+    """Sizes + keys of the three process-global GitPolicyFetcher caches, RSS,
+    and the worker pid (per-process caches: the pid identifies WHICH worker
+    answered, so multi-worker bed tests can assert per-worker drain)."""
+    # Snapshot each cache once (dict.copy() is a single C-level operation,
+    # atomic under the GIL): this handler runs on a Starlette worker thread
+    # while the caches are mutated on the event-loop/executor threads, so
+    # iterating the live dicts can raise "dictionary changed size during
+    # iteration", and reading len() and keys() separately can return a
+    # self-contradictory count/keys pair.
+    repo_locks = GitPolicyFetcher.repo_locks.copy()
+    repos = GitPolicyFetcher.repos.copy()
+    repos_last_fetched = GitPolicyFetcher.repos_last_fetched.copy()
     return {
-        "repo_locks": len(GitPolicyFetcher.repo_locks),
-        "repos": len(GitPolicyFetcher.repos),
-        "repos_last_fetched": len(GitPolicyFetcher.repos_last_fetched),
+        "pid": os.getpid(),
+        "repo_locks": len(repo_locks),
+        "repos": len(repos),
+        "repos_last_fetched": len(repos_last_fetched),
         "rss_kb": _read_rss_kb(),
+        "repo_locks_keys": sorted(repo_locks.keys()),
+        "repos_keys": sorted(repos.keys()),
+        "repos_last_fetched_keys": sorted(repos_last_fetched.keys()),
     }
 
 
@@ -57,5 +73,5 @@ def register_internal_stats_route(
         include_in_schema=False,
         dependencies=dependencies or [],
     )
-    def _git_fetcher_cache_stats() -> Dict[str, int]:
+    def _git_fetcher_cache_stats() -> Dict:
         return git_fetcher_cache_stats()
