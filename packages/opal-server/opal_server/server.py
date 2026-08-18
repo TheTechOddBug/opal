@@ -40,11 +40,18 @@ from opal_server.pubsub_resilience import ReconnectingBroadcaster
 from opal_server.redis_utils import RedisDB
 from opal_server.scopes.api import init_scope_router
 from opal_server.scopes.loader import load_scopes
+from opal_server.scopes.purge import subscribe_worker_purge_handler
 from opal_server.scopes.scope_repository import ScopeRepository
 from opal_server.scopes.service import ScopesService
 from opal_server.security.api import init_security_router
 from opal_server.security.jwks import JwksStaticEndpoint
 from opal_server.statistics import OpalStatistics, init_statistics_router
+
+# Upper bound on the shutdown drain of the DELETE floor's clone purges. Same
+# rationale and same order of magnitude as the watcher's _PURGE_DRAIN_TIMEOUT:
+# stop() runs while k8s's terminationGracePeriodSeconds (30s default) is
+# counting down, so blocking longer just converts a clean exit into a SIGKILL.
+_SCOPES_DRAIN_TIMEOUT = 5.0
 
 
 class OpalServer:
@@ -191,6 +198,10 @@ class OpalServer:
             self._scopes = ScopeRepository(self._redis_db)
             logger.info("OPAL Scopes: server is connected to scopes repository")
 
+        # Set BEFORE _init_fast_api_app(): _configure_api_routes assigns it,
+        # and it must exist even when SCOPES is off (shutdown reads it).
+        self._scopes_service: Optional[ScopesService] = None
+
         # init fastapi app
         self.app: FastAPI = self._init_fast_api_app()
 
@@ -277,6 +288,14 @@ class OpalServer:
                 scopes=self._scopes,
                 pubsub_endpoint=self.pubsub.endpoint,
             )
+            # Held so shutdown can drain it. THIS is the instance DELETE runs on
+            # (api.py -> scopes_service.delete_scope), so this is the one whose
+            # _local_purges accumulates the backgrounded clone-dir purges. The
+            # watcher builds its own separate ScopesService and only ever syncs
+            # with it — draining that one drains an empty set. The watcher is
+            # also leader-only, and a DELETE usually lands on a non-leader, so
+            # it could not be the drain point even if it shared the object.
+            self._scopes_service = scopes_service
             app.include_router(
                 init_scope_router(
                     self._scopes, authenticator, self.pubsub.endpoint, scopes_service
@@ -312,15 +331,23 @@ class OpalServer:
             # and k8s can route away from / restart this worker. Stays ok through a
             # normal transient reconnect (see ReconnectingBroadcaster.is_reader_healthy).
             broadcaster = self.pubsub.broadcaster
-            if (
-                opal_server_config.BROADCAST_HEALTHCHECK_ENABLED
-                and isinstance(broadcaster, ReconnectingBroadcaster)
-                and not broadcaster.is_reader_healthy()
+            if opal_server_config.BROADCAST_HEALTHCHECK_ENABLED and isinstance(
+                broadcaster, ReconnectingBroadcaster
             ):
-                return JSONResponse(
-                    status_code=503,
-                    content={"status": "error", "broadcaster": "unhealthy"},
+                healthy = broadcaster.is_reader_healthy()
+                # Publish what the probe already decided. A wedged reader is
+                # otherwise invisible outside this handler: staging runs no
+                # liveness probe, so nothing acts on the 503 below.
+                metrics.gauge(
+                    "opal_server.broadcaster_reader_healthy",
+                    1 if healthy else 0,
+                    tags={"pid": str(os.getpid())},
                 )
+                if not healthy:
+                    return JSONResponse(
+                        status_code=503,
+                        content={"status": "error", "broadcaster": "unhealthy"},
+                    )
             return {"status": "ok"}
 
         register_internal_stats_route(
@@ -386,6 +413,13 @@ class OpalServer:
                         self.opal_statistics.remove_client
                     )
 
+                if opal_server_config.SCOPES:
+                    # Every worker (leader or not) must drop its in-memory
+                    # GitPolicyFetcher caches when a scope is deleted/repointed
+                    # anywhere in the fleet. Subscribed before the leadership
+                    # lock on purpose: non-leaders block on that lock forever.
+                    await subscribe_worker_purge_handler(self.pubsub.endpoint)
+
                 # We want only one worker to run repo watchers
                 # (otherwise for each new commit, we will publish multiple updates via pub/sub).
                 # leadership is determined by the first worker to obtain a lock
@@ -434,6 +468,15 @@ class OpalServer:
 
         tasks: List[asyncio.Task] = []
 
+        if self._scopes_service is not None:
+            # Bounded: a floor task's first act is to take lock_source, which a
+            # sync can hold across a whole clone/fetch. Unbounded here would
+            # hang shutdown; abandoning is the same outcome as not draining at
+            # all, so the timeout is the safe direction.
+            tasks.append(
+                asyncio.create_task(self._drain_scopes_service(_SCOPES_DRAIN_TIMEOUT))
+            )
+
         if self.watcher is not None:
             tasks.append(asyncio.create_task(self.watcher.stop()))
         if self.publisher is not None:
@@ -447,6 +490,27 @@ class OpalServer:
             await asyncio.gather(*tasks)
         except Exception:
             logger.exception("exception while shutting down background tasks")
+
+    async def _drain_scopes_service(self, timeout: float) -> None:
+        """Await the DELETE floor's backgrounded clone-dir purges, bounded.
+
+        Without this, a DELETE that returns 204 followed by SIGTERM loses its
+        floor: the task is detached, nothing else references it, and the clone
+        dir it was about to remove survives with nothing left to reclaim it (no
+        reconciliation in this PR — PER-15612). Master removed the dir inline,
+        before returning 204, so an undrained floor is a regression against the
+        merge base rather than merely a missing improvement.
+        """
+        try:
+            await asyncio.wait_for(self._scopes_service.stop(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Abandoned in-flight scope clone purges at shutdown after "
+                "{timeout}s; their clone dirs stay on disk (PER-15612)",
+                timeout=timeout,
+            )
+        except Exception:
+            logger.exception("Failed to drain scope clone purges at shutdown")
 
     def _wire_broadcaster_give_up(self):
         """Graceful-restart the worker if the reconnecting broadcaster gives

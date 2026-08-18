@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from opal_common.schemas.policy_source import GitPolicyScopeSource, NoAuthData
 from opal_common.schemas.scopes import Scope
+from opal_server.config import opal_server_config
 from opal_server.git_fetcher import GitPolicyFetcher
 from opal_server.scopes.api import init_scope_router
 from opal_server.scopes.scope_repository import ScopeNotFoundError
@@ -47,11 +48,11 @@ def _scope(scope_id, url, branch="main"):
     )
 
 
-def _client(repo, base_dir):
-    service = ScopesService(base_dir=base_dir, scopes=repo, pubsub_endpoint=None)
+def _client(repo, base_dir, pubsub=None):
+    service = ScopesService(base_dir=base_dir, scopes=repo, pubsub_endpoint=pubsub)
     app = FastAPI()
     app.include_router(
-        init_scope_router(repo, FakeAuthenticator(), None, service),
+        init_scope_router(repo, FakeAuthenticator(), pubsub, service),
         prefix="/scopes",
     )
     return TestClient(app)
@@ -68,26 +69,26 @@ def clear_caches():
     GitPolicyFetcher.repo_locks.clear()
 
 
-def test_delete_route_purges_fetcher_caches(tmp_path, monkeypatch):
-    """DELETE /scopes/{id} must flow through ScopesService.delete_scope so the
-    GitPolicyFetcher caches drain (the git-leak churn gate)."""
+def test_delete_route_deletes_the_record_without_pubsub(tmp_path):
+    """DELETE /scopes/{id} must flow through ScopesService.delete_scope and
+    delete the record even with no pubsub endpoint wired (degraded mode).
+
+    Cache purging is two-phase fleet-wide (the leader's sibling-checked
+    confirmation drains every worker) plus a best-effort LOCAL floor
+    that delete_scope spawns for the serving worker. The floor is
+    deliberately backgrounded, and TestClient tears its loop down at the
+    end of the request, so asserting on the caches from here would be a
+    coin flip in either direction. Its effect is pinned
+    deterministically instead, by delete_scope_cache_purge_test's floor
+    tests, which drain the task.
+    """
     scope = _scope("only", "https://git/repo-a.git")
     repo = FakeScopeRepository([scope])
-
-    sid = GitPolicyFetcher.source_id(scope.policy)
-    clone_path = str(GitPolicyFetcher.repo_clone_path(tmp_path, scope.policy))
-    GitPolicyFetcher.repos[clone_path] = object()
-    GitPolicyFetcher.repos_last_fetched[sid] = "ts"
-
-    monkeypatch.setattr(
-        "opal_server.scopes.service.shutil.rmtree", lambda *a, **k: None
-    )
 
     resp = _client(repo, tmp_path).delete("/scopes/only")
 
     assert resp.status_code == 204
-    assert clone_path not in GitPolicyFetcher.repos
-    assert sid not in GitPolicyFetcher.repos_last_fetched
+    assert "only" not in repo._scopes  # record deleted
 
 
 def test_delete_route_missing_scope_stays_204(tmp_path):
@@ -95,3 +96,26 @@ def test_delete_route_missing_scope_stays_204(tmp_path):
     wiring and must remain one."""
     resp = _client(FakeScopeRepository([]), tmp_path).delete("/scopes/ghost")
     assert resp.status_code == 204
+
+
+class FakePubSubEndpoint:
+    def __init__(self):
+        self.published = []
+
+    async def publish(self, topics, data=None):
+        self.published.append((list(topics), data))
+
+
+def test_delete_route_publishes_purge_request(tmp_path):
+    scope = _scope("only", "https://git/repo-a.git")
+    repo = FakeScopeRepository([scope])
+    pubsub = FakePubSubEndpoint()
+    sid = GitPolicyFetcher.source_id(scope.policy)
+    resp = _client(repo, tmp_path, pubsub=pubsub).delete("/scopes/only")
+    assert resp.status_code == 204
+    assert "only" not in repo._scopes
+    assert len(pubsub.published) == 1
+    topics, payload = pubsub.published[0]
+    assert topics == [opal_server_config.SCOPES_PURGE_CHANNEL]
+    assert payload["source_id"] == sid and payload["scope_id"] == "only"
+    assert payload["reason"] == "delete" and payload["confirmed"] is False

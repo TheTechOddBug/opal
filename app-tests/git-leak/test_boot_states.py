@@ -2,6 +2,7 @@
 
 The cold-empty start (S1) is covered by test_boot.py.
 """
+import os
 import time
 
 import pytest
@@ -105,10 +106,17 @@ def test_corrupt_clone_recovers_without_clone_loop(opal):
 
 
 @pytest.mark.timeout(900)
+# I3/I4 were exempted here while the docstring already claimed the gate was
+# green — exempting exactly the invariants the purge under test exists to
+# satisfy. Measured on this head: all three of these gates pass with I3/I4
+# enforced, so the exemptions were stale and are gone. I1 stays: a delete or
+# repoint that races a hung clone still leaves the DIR on disk (nothing
+# reconciles in this PR — PER-15612), which is the documented trade, not a
+# memory leak.
 @pytest.mark.invariant_exempt("I1")
 def test_orphan_clone_dir_is_reclaimed(opal):
-    """RED until an orphan sweep exists (PR3+, currently unowned): a clone dir
-    with no live scope must eventually be removed."""
+    """RED until an orphan sweep exists (PR3+, tracked as PER-15612): a clone
+    dir with no live scope must eventually be removed."""
     fake_sid = "f" * 64 + "-0"
     compose(
         "exec",
@@ -139,9 +147,9 @@ def test_orphan_clone_dir_is_reclaimed(opal):
 @pytest.mark.allow_worker_restart
 @pytest.mark.invariant_exempt("I1")
 def test_redis_wiped_boot_reclaims_clones(opal):
-    """RED until the orphan sweep (same class as the orphan-dir gate): after a
-    scope-store wipe, on-disk clones reference nothing and must be
-    reclaimed."""
+    """RED until the orphan sweep lands (PER-15612; same class as the orphan-
+    dir gate): after a scope-store wipe, on-disk clones reference nothing and
+    must be reclaimed."""
     opal.put_scope("wipe-0", gitea_repo_url(list_seeded_repos(1)[0]))
     assert wait_until(
         lambda: opal.get_scope_policy("wipe-0").status_code == 200, timeout=300
@@ -172,13 +180,13 @@ def test_redis_wiped_boot_reclaims_clones(opal):
 
 @pytest.mark.timeout(1200)
 @pytest.mark.allow_worker_restart
-@pytest.mark.invariant_exempt("I1", "I3", "I4")
+@pytest.mark.invariant_exempt("I1")
 def test_boot_with_unreachable_remotes_still_serves_healthy(opal):
-    """RED until PR3 (fetch timeout) — WATCH THIS FLIP when PR3 merges.
+    """Gate for PR3's fetch timeout; green since it landed.
 
-    Boot-time cousin of the offline gate: unreachable remotes present at boot
-    hang the preload/first-sync clones and starve the executor, so a healthy
-    scope can't serve.
+    Boot-time cousin of the offline gate: without the timeout, unreachable
+    remotes present at boot hang the preload/first-sync clones and starve the
+    executor, so a healthy scope can't serve.
     """
     for i in range(10):
         opal.put_scope(f"down-{i}", make_repo_unreachable(f"down-{i}-repo"))
@@ -212,7 +220,8 @@ def test_boot_with_unreachable_remotes_still_serves_healthy(opal):
 def test_shard_reconfig_still_serves_but_orphans_old_clones(opal, tmp_path):
     """S5: SCOPES_REPO_CLONES_SHARDS reconfig moves every source_id.
     GREEN half: serving must survive the reshard (re-clone under new ids).
-    RED half (until the orphan sweep): the old-shard dirs are orphaned."""
+    RED half (until the orphan sweep lands, PER-15612): the old-shard dirs are
+    orphaned."""
     import os
 
     from invariants import live_source_ids

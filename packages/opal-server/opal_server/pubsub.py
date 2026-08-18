@@ -142,6 +142,7 @@ class PubSub:
         # Pub/Sub Internals
         self.notifier = WebSocketRpcEventNotifier()
         self.notifier.add_channel_restriction(type(self)._verify_permitted_topics)
+        self.notifier.add_channel_restriction(type(self)._reject_external_purge_channel)
         self.client_tracker = ClientTracker()
         self.notifier.register_subscribe_event(self.client_tracker.on_subscribe)
         self.notifier.register_unsubscribe_event(self.client_tracker.on_unsubscribe)
@@ -226,6 +227,10 @@ class PubSub:
             # keepalive — dropping those corrupts state no resync rebuilds). The coordination
             # channels are exempted by their CONFIGURED names: the endpoint's own "__" prefix
             # rule covers only the defaults, and every one of these is operator-overridable.
+            # Worker-to-worker cache purge on scope delete/repoint.
+            # Freezing it during a backbone gap would leave stale GitPolicyFetcher
+            # caches fleet-wide with nothing to replay the purge. Exempt by its
+            # CONFIGURED name because it is operator-overridable to a non-"__" value.
             freeze_exempt_topics=[
                 opal_server_config.POLICY_REPO_WEBHOOK_TOPIC,
                 opal_server_config.BROADCAST_KEEPALIVE_TOPIC,
@@ -234,6 +239,7 @@ class PubSub:
                 opal_server_config.STATISTICS_SERVER_KEEPALIVE_CHANNEL,
                 opal_common_config.STATISTICS_ADD_CLIENT_CHANNEL,
                 opal_common_config.STATISTICS_REMOVE_CLIENT_CHANNEL,
+                opal_server_config.SCOPES_PURGE_CHANNEL,
             ],
         )
         # fastapi_websocket_rpc's ConnectionManager.disconnect is not idempotent: the RPC
@@ -348,4 +354,54 @@ class PubSub:
         if unauthorized_topics:
             raise Unauthorized(
                 description=f"Invalid 'topics' to subscribe {unauthorized_topics}"
+            )
+
+    @staticmethod
+    async def _reject_external_purge_channel(
+        topics: Union[TopicList, ALL_TOPICS], channel: RpcChannel
+    ):
+        """Forbid external RPC peers from touching the scope-purge channel.
+
+        ``SCOPES_PURGE_CHANNEL`` is a server-internal control channel: a purge
+        command evicts every worker's ``GitPolicyFetcher`` caches fleet-wide.
+        The only legitimate publishers
+        are opal-server itself (delete / repoint) and the
+        cross-server broadcaster relay — both call ``notify()`` with
+        ``channel=None``, and channel restrictions run **only when a channel is
+        present** (see ``EventNotifier.notify``/``subscribe``: ``if channel:``).
+        So this restriction never fires for legitimate server traffic; it only
+        sees an external websocket peer (a client/PDP).
+
+        Without this gate any connected peer could forge a purge and churn the
+        whole fleet's caches, because ``_verify_permitted_topics`` above
+        default-allows tokens that carry no ``permitted_topics`` claim (the
+        common case). No legitimate client ever names this channel — clients
+        only publish to ``STATISTICS_ADD_CLIENT_CHANNEL`` — so rejecting it here
+        blocks the forgery without affecting any real client (publish or
+        subscribe); no client change/redeploy is required.
+
+        ``ALL_TOPICS`` is rejected too. It is exempt for *publish* (a publish
+        never fans out to a specific-topic subscriber through it), but the same
+        callback also guards *subscribe*, and ``EventNotifier.notify`` fans
+        every published topic — the purge channel included — to the
+        ``ALL_TOPICS`` subscriber bucket. So a peer subscribing to
+        ``ALL_TOPICS`` would still receive purge traffic. No opal-client ever
+        subscribes to ``ALL_TOPICS`` (only the broadcaster does, and that is
+        ``channel=None`` so it never reaches this callback), so rejecting it
+        from external peers is safe.
+        """
+        # Normalize: the notifier may hand us a single topic (str), a list, or
+        # the ALL_TOPICS sentinel (also a str). An external peer may name
+        # neither the purge channel nor ALL_TOPICS.
+        topic_list = [topics] if isinstance(topics, str) else list(topics)
+        if (
+            ALL_TOPICS in topic_list
+            or opal_server_config.SCOPES_PURGE_CHANNEL in topic_list
+        ):
+            raise Unauthorized(
+                description=(
+                    f"Topic '{opal_server_config.SCOPES_PURGE_CHANNEL}' (and "
+                    "ALL_TOPICS, which would receive it) is server-internal and "
+                    "may not be published or subscribed by external peers"
+                )
             )

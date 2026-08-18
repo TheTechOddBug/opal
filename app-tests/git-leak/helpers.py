@@ -139,6 +139,36 @@ class OpalServerClient:
             compose("start", "opal_server")
             self._created_scopes.clear()
             self.wait_healthy(timeout=timeout)
+            # wait_healthy returns once HTTP is up, but boot sync is still
+            # settling (each source it touches mints and pops a repo_locks
+            # entry). Wait for repo_locks==0 so the fixture-teardown invariant
+            # check can't catch a transient minted-not-yet-popped lock (a flaky
+            # I4 on the offline-repo test).
+            #
+            # NOTE: this does NOT wait for clone dirs to be reclaimed — nothing
+            # reclaims them. The flushed scopes' dirs stay on disk (no
+            # reconciliation in this PR; PER-15612), which is why the tests that
+            # call hard_reset carry an I1 exemption.
+            deadline = time.time() + 30
+            settled = False
+            last_err = None
+            while time.time() < deadline:
+                try:
+                    if self.stats(samples=1)["repo_locks"] == 0:
+                        settled = True
+                        break
+                except Exception as exc:  # a stats read racing the restart
+                    last_err = exc
+                time.sleep(0.5)
+            if not settled:
+                # Previously this loop swallowed every exception and had no
+                # post-loop check, so a server that never came back just made it
+                # a silent 30s sleep and the caller carried on into assertions
+                # that could not hold.
+                raise RuntimeError(
+                    f"hard_reset: repo_locks never settled to 0 within 30s "
+                    f"(last stats error: {last_err!r})"
+                )
 
     def delete_all_scopes(self, drain_timeout: int = 3) -> None:
         """Delete every scope the *server* knows (not just this client's), then
